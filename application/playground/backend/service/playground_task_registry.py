@@ -162,6 +162,13 @@ PLAYGROUND_TASK_INDEX: Dict[str, PlaygroundTaskEntry] = {
         output_artifact="book_choice.json",
         submission_profile="book_choice",
     ),
+    "web-cloudflare-plan-comparison": PlaygroundTaskEntry(
+        application_type="web",
+        site_name="Cloudflare pricing",
+        site_url="https://www.cloudflare.com/plans/",
+        output_artifact="cloudflare_plan_comparison.json",
+        submission_profile="cloudflare_plan_comparison",
+    ),
     # Chatbot
     "chat_recai": PlaygroundTaskEntry(application_type="chatbot"),
     "chat_deeptutor-learning-goal": PlaygroundTaskEntry(application_type="chatbot"),
