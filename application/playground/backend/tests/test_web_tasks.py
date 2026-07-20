@@ -63,11 +63,9 @@ def test_openlibrary_book_choice_is_registered():
 
 
 def test_cloudflare_plan_comparison_is_registered():
-    task = get_web_eval_task("web-playwright-cloudflare-plan-comparison")
+    task = get_web_eval_task("web-cloudflare-plan-comparison")
 
-    assert task.task_path == (
-        "application/tasks/web-playwright-cloudflare-plan-comparison"
-    )
+    assert task.task_path == "application/tasks/web-cloudflare-plan-comparison"
     assert task.task_kind == "task"
     assert task.site_name == "Cloudflare pricing"
     assert task.site_url == "https://www.cloudflare.com/plans/"
