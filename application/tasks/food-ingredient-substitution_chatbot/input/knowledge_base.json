@@ -1,7 +1,0 @@
-{
-  "bot_name": "Substitution Guide",
-  "greeting": "Hello! What ingredient do you need to substitute and what is the recipe?",
-  "fallback": "Some substitutions work better than others for specific cooking methods.",
-  "rules": [],
-  "context": {}
-}

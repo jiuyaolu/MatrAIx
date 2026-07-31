@@ -1,7 +1,0 @@
-{
-  "bot_name": "Movie Matchmaker",
-  "greeting": "Hello! What kind of mood are you in tonight?",
-  "fallback": "I need to know what streaming services you have.",
-  "rules": [],
-  "context": {}
-}
