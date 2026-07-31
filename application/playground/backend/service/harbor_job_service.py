@@ -492,6 +492,9 @@ class HarborJobService:
     _guard: threading.Lock = field(default_factory=threading.Lock)
     _status_states: dict[str, "_JobStatusState"] = field(default_factory=dict)
     _status_guard: threading.Lock = field(default_factory=threading.Lock)
+    # Poll interval for per-trial host scoring while Harbor is still running.
+    _host_score_poll_sec: float = 2.0
+    _host_score_join_timeout_sec: float = 600.0
 
     @classmethod
     def from_repo(cls, *, repo_root: Path | None = None, jobs_dir: Path | None = None) -> "HarborJobService":
@@ -1122,9 +1125,10 @@ class HarborJobService:
                         # use.computer defaults to 50 steps; stocks/news-style
                         # browse+decide tasks routinely need more headroom.
                         kwargs.setdefault("max_steps", 100)
-        # use-computer OS-app tasks hand in JSON; sandbox path remap makes in-VM
-        # verify flaky. Score on the Playground host from downloaded artifacts /
-        # final_answer / trajectory instead (see playground.host_verifier).
+        # use-computer OS-app tasks hand in JSON; sandbox path remap makes
+        # *remote* in-VM verify flaky. Disable Harbor's per-trial verifier and
+        # score on the Playground host as each trial finishes (watcher), with a
+        # job-end rescue sweep (see playground.host_verifier).
         env_block = job_config.get("environment")
         if isinstance(env_block, dict) and env_block.get("type") == "use-computer":
             existing_verifier = job_config.get("verifier")
@@ -1339,7 +1343,7 @@ class HarborJobService:
                 command_runner=self.command_runner,
                 harbor_command=self.harbor_command,
             )
-            coordinator.run()
+            self._run_with_trial_host_scoring(job_name, coordinator.run)
             status = "completed"
             error = None
             exit_code = 0
@@ -1354,6 +1358,7 @@ class HarborJobService:
             record.exit_code = exit_code
             record.error = error
             record.finished_at = _utc_now()
+        # Rescue anything the per-trial watcher missed (idempotent).
         self._maybe_run_host_verifier(job_name)
         self._maybe_generate_post_run_feedback(job_name)
         self._maybe_schedule_reporting(job_name, self.jobs_dir / job_name)
@@ -1390,11 +1395,18 @@ class HarborJobService:
             chat_max_turns=chat_max_turns,
         )
         try:
-            exit_code = self.command_runner(
-                command,
-                cwd=self.repo_root,
-                env=env,
-            )
+            held: dict[str, Any] = {}
+
+            def _invoke() -> None:
+                code = self.command_runner(
+                    command,
+                    cwd=self.repo_root,
+                    env=env,
+                )
+                held["exit_code"] = code
+
+            self._run_with_trial_host_scoring(job_name, _invoke)
+            exit_code = int(held.get("exit_code", 1))
             error = None if exit_code == 0 else "harbor run exited with code {}".format(exit_code)
             status = "completed" if exit_code == 0 else "failed"
         except Exception as exc:  # noqa: BLE001
@@ -1408,6 +1420,7 @@ class HarborJobService:
             record.exit_code = exit_code
             record.error = error
             record.finished_at = _utc_now()
+        # Rescue anything the per-trial watcher missed (idempotent).
         self._maybe_run_host_verifier(job_name)
         self._maybe_generate_post_run_feedback(job_name)
         self._maybe_schedule_reporting(job_name, self.jobs_dir / job_name)
@@ -1468,39 +1481,103 @@ class HarborJobService:
             record.exit_code = exit_code
             record.error = error
             record.finished_at = _utc_now()
+        # Remote trials land locally after wait; job-end scoring is the primary path.
         self._maybe_run_host_verifier(job_name)
         self._maybe_generate_post_run_feedback(job_name)
         self._maybe_schedule_reporting(job_name, self.jobs_dir / job_name)
 
-    def _maybe_run_host_verifier(self, job_name: str) -> None:
-        from playground.host_verifier import maybe_run_host_verifier
-
+    def _iter_scorable_trial_dirs(self, job_name: str) -> list[Path]:
         job_dir = self.jobs_dir / job_name
         if not job_dir.is_dir():
-            return
+            return []
+        trials: list[Path] = []
         for trial_dir in sorted(job_dir.iterdir()):
             if not trial_dir.is_dir() or trial_dir.name.startswith("_"):
                 continue
             if not (trial_dir / "config.json").is_file():
                 continue
+            trials.append(trial_dir)
+        return trials
+
+    def _score_finished_trial_on_host(self, trial_dir: Path) -> None:
+        """Run host verify + optional post-run feedback for one finished trial.
+
+        Idempotent: host_verifier skips already-passed rewards; feedback skips
+        when the artifact already exists.
+        """
+        try:
+            from playground.host_verifier import maybe_run_host_verifier
+
+            maybe_run_host_verifier(repo_root=self.repo_root, trial_dir=trial_dir)
+        except Exception:
+            pass
+        try:
+            from playground.post_run_feedback import maybe_write_trial_user_feedback
+
+            maybe_write_trial_user_feedback(repo_root=self.repo_root, trial_dir=trial_dir)
+        except Exception:
+            pass
+
+    def _score_new_finished_trials_on_host(
+        self, job_name: str, *, already_scored: set[str]
+    ) -> None:
+        """Score trials that have ``result.json`` and have not been attempted yet."""
+        for trial_dir in self._iter_scorable_trial_dirs(job_name):
+            if trial_dir.name in already_scored:
+                continue
+            if not (trial_dir / "result.json").is_file():
+                continue
+            self._score_finished_trial_on_host(trial_dir)
+            already_scored.add(trial_dir.name)
+
+    def _watch_and_score_trials_on_host(
+        self, job_name: str, stop_event: threading.Event
+    ) -> None:
+        """Poll for finished trials and score them while Harbor is still running."""
+        already_scored: set[str] = set()
+        poll_sec = max(0.05, float(self._host_score_poll_sec))
+        while not stop_event.wait(poll_sec):
+            self._score_new_finished_trials_on_host(
+                job_name, already_scored=already_scored
+            )
+        # Final sweep after Harbor exits (catch the last finishing trials).
+        self._score_new_finished_trials_on_host(job_name, already_scored=already_scored)
+
+    def _run_with_trial_host_scoring(
+        self, job_name: str, run_fn: Callable[[], None]
+    ) -> None:
+        """Run Harbor (or local distributed) with a per-trial host-scoring watcher."""
+        stop_event = threading.Event()
+        watcher = threading.Thread(
+            target=self._watch_and_score_trials_on_host,
+            args=(job_name, stop_event),
+            name="host-score-{}".format(job_name),
+            daemon=True,
+        )
+        watcher.start()
+        try:
+            run_fn()
+        finally:
+            stop_event.set()
+            watcher.join(timeout=float(self._host_score_join_timeout_sec))
+
+    def _maybe_run_host_verifier(self, job_name: str) -> None:
+        """Job-end rescue: host-score any trial still missing a reward."""
+        from playground.host_verifier import maybe_run_host_verifier
+
+        for trial_dir in self._iter_scorable_trial_dirs(job_name):
             try:
                 maybe_run_host_verifier(repo_root=self.repo_root, trial_dir=trial_dir)
             except Exception:
                 continue
 
     def _maybe_generate_post_run_feedback(self, job_name: str) -> None:
+        """Job-end rescue: write user_feedback for trials still missing it."""
         from playground.post_run_feedback import (
             maybe_write_trial_user_feedback,
         )
 
-        job_dir = self.jobs_dir / job_name
-        if not job_dir.is_dir():
-            return
-        for trial_dir in sorted(job_dir.iterdir()):
-            if not trial_dir.is_dir() or trial_dir.name.startswith("_"):
-                continue
-            if not (trial_dir / "config.json").is_file():
-                continue
+        for trial_dir in self._iter_scorable_trial_dirs(job_name):
             try:
                 maybe_write_trial_user_feedback(repo_root=self.repo_root, trial_dir=trial_dir)
             except Exception:

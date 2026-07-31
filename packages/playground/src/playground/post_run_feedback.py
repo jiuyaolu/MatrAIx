@@ -31,7 +31,7 @@ from playground.user_sim.self_report_contract import (
     schema_prompt_block,
 )
 
-_REFLECTION_USER = """You have now FINISHED using this {application_label} task as the persona.
+_REFLECTION_USER = """You have just finished using this {application_label}.
 Only use what you actually saw, did, or produced during this run.
 
 ## Run artifacts
@@ -231,7 +231,7 @@ def maybe_write_trial_user_feedback(*, repo_root: Path, trial_dir: Path) -> Path
         artifact_summary=_artifact_summary(output_dir, skip_names={feedback_path.name}),
         trace_summary=_trace_summary(find_trial_logs_dir(trial_dir)),
         instructions=schema.instructions
-        or "Reflect honestly from your own point of view as this persona.",
+        or "Answer honestly from your own point of view.",
         schema_block=schema_prompt_block(schema),
     )
     client = build_json_client(_persona_model_from_trial(trial_dir), temperature=0.1)

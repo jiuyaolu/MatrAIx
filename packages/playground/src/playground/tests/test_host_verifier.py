@@ -212,6 +212,76 @@ def test_host_verifier_rescues_zero_reward_from_trajectory(tmp_path: Path):
     assert result["verifier_result"] == {"rewards": {"reward": 1.0}}
 
 
+def test_parse_json_object_uses_first_balanced_object_when_agent_keeps_talking():
+    from playground.host_verifier import _parse_json_object
+
+    text = (
+        'Here is my answer:\n'
+        '```json\n'
+        '{\n'
+        '  "ticker": "MU",\n'
+        '  "sentiment": "buy",\n'
+        '  "confidence": 7\n'
+        '}\n'
+        '```\n\n'
+        'Wait, let me reconsider...\n'
+        '```json\n'
+        '{\n'
+        '  "ticker": "MU",\n'
+        '  "sentiment": "hold",\n'
+        '  "confidence": 4\n'
+        '}\n'
+        '```\n'
+    )
+    parsed = _parse_json_object(text)
+    assert parsed == {"ticker": "MU", "sentiment": "buy", "confidence": 7}
+
+
+def test_host_verifier_materializes_when_trajectory_has_trailing_second_json(
+    tmp_path: Path,
+):
+    repo_root = tmp_path / "repo"
+    task_rel = "application/tasks/fake-os-app"
+    _write_fake_task(repo_root, task_rel, artifact_source="/app/output")
+
+    trial_dir = tmp_path / "trial"
+    _write_trial(
+        trial_dir,
+        task_rel,
+        artifact_source="/app/output",
+        with_decision=False,
+        with_exception=False,
+    )
+    agent_dir = trial_dir / "agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "trajectory.json").write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "step_id": 1,
+                        "message": (
+                            '{\n  "clicked": true\n}\n'
+                            "```\n\nWait, double-checking...\n"
+                            '```json\n{\n  "clicked": false\n}\n```'
+                        ),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ran = maybe_run_host_verifier(repo_root=repo_root, trial_dir=trial_dir)
+    assert ran is True
+    decision = json.loads(
+        (trial_dir / "artifacts" / "app" / "output" / "decision.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert decision == {"clicked": True}
+
+
 def test_host_verifier_skips_zero_reward_without_recoverable_submission(tmp_path: Path):
     repo_root = tmp_path / "repo"
     task_rel = "application/tasks/fake-os-app"

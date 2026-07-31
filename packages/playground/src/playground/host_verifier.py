@@ -1,13 +1,14 @@
 """Score an OS-app trial on the Playground host from downloaded artifacts.
 
 For **use-computer** (macOS/iOS) jobs, Playground disables the in-sandbox
-verifier and relies on this host path as the primary scorer: the agent's
-final JSON lives on the host (``agent/final_answer.txt`` / trajectory), while
-sandbox ``/app/output`` writes are remapped and often missing.
+verifier (remote path remap is flaky). The primary host scoring path is
+**per-trial**: as soon as a trial writes ``result.json``, Playground runs
+this module against host artifacts / ``final_answer.txt`` / trajectory.
+A job-end sweep remains as **rescue** for anything the watcher missed.
 
 Harbor may still run ``tests/test.sh`` inside Docker computer-use sandboxes
-(mounted paths). This module also remains a rescue when a sandbox left no
-reward or scored ``0`` despite a recoverable host-side submission.
+(mounted paths). This module also rescues when a sandbox left no reward or
+scored ``0`` despite a recoverable host-side submission.
 
 Artifact source paths and timeouts come from the task's ``task.toml``; the
 host path under ``trial/artifacts/`` follows Harbor's
@@ -38,7 +39,6 @@ _OUTPUT_ARTIFACT_RE = re.compile(
     r"""OUTPUT_DIR\s*/\s*["']([^"']+\.json)["']"""
 )
 _SKIP_OUTPUT_ARTIFACTS = frozenset({"user_feedback.json"})
-_JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}")
 
 
 def _lock_for(key: str) -> Lock:
@@ -179,12 +179,51 @@ def _expected_output_artifacts(task_dir: Path) -> list[str]:
     return ordered
 
 
+def _first_balanced_json_object(text: str) -> str | None:
+    """Return the first top-level ``{...}`` span, respecting strings/escapes.
+
+    A greedy ``\\{[\\s\\S]*\\}`` match fails when the agent emits a valid JSON
+    object and then keeps talking (or prints a second JSON block). Prefer the
+    first balanced object so trailing commentary does not poison ``json.loads``.
+    """
+    if not text:
+        return None
+    start = -1
+    depth = 0
+    in_string = False
+    escape = False
+    for index, char in enumerate(text):
+        if escape:
+            escape = False
+            continue
+        if in_string:
+            if char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            if depth == 0:
+                continue
+            depth -= 1
+            if depth == 0 and start != -1:
+                return text[start : index + 1]
+    return None
+
+
 def _parse_json_object(text: str) -> dict | None:
-    match = _JSON_OBJECT_RE.search(text or "")
-    if not match:
+    candidate = _first_balanced_json_object(text or "")
+    if candidate is None:
         return None
     try:
-        parsed = json.loads(match.group())
+        parsed = json.loads(candidate)
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None

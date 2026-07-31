@@ -10,7 +10,10 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.models.agent.name import AgentName
 
-from matraix.agents.persona.cua_submission import materialize_cua_submission_profile
+from matraix.agents.persona.cua_submission import (
+    materialize_cua_submission_profile,
+    materialize_final_answer_file,
+)
 from matraix.agents.persona.ios_submission import materialize_ios_decision_file
 from matraix.agents.persona.mixin import PersonaMixin
 
@@ -250,6 +253,15 @@ class PersonaComputer1(PersonaMixin, BaseAgent):
             )
         elif self._delegate_kind == "ios":
             await materialize_ios_decision_file(
+                environment,
+                self.logs_dir,
+                logger=self.logger,
+            )
+        elif self._delegate_kind == "use_computer_desktop":
+            # Task-agnostic hand-in: mirror Computer1's final_answer.txt contract
+            # into host logs + /app/output so artifact collection / host_verifier
+            # can recover the submission without a per-task profile.
+            await materialize_final_answer_file(
                 environment,
                 self.logs_dir,
                 logger=self.logger,

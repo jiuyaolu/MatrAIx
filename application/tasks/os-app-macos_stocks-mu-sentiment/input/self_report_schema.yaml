@@ -1,13 +1,11 @@
 artifactName: user_feedback.json
 instructions: |
-  Reflect honestly as the persona after finishing this stock research task.
-  Focus on whether the information you gathered felt sufficient, how the
-  earnings context influenced your decision, and how confident you are.
+  You've finished researching MU in the Stocks app. Answer from what you
+  actually saw and decided — do not revise your buy/sell/hold call here.
+  Focus on whether the chart and news felt like enough information, how much
+  the earnings context mattered, and how confident you feel about the call
+  you already made.
 fields:
-  - key: sentiment
-    prompt: What is your final investment decision for MU?
-    kind: enum
-    choices: [buy, hold, sell]
   - key: informationSufficiency
     prompt: Did the Stocks app provide enough information (chart + news) to form a confident opinion?
     kind: enum

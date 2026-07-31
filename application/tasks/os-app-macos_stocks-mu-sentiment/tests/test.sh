@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -25,12 +24,45 @@ OUTPUT_DIR = Path(
 
 path = OUTPUT_DIR / "sentiment.json"
 
+def _first_balanced_json_object(text: str) -> str | None:
+    if not text:
+        return None
+    start = -1
+    depth = 0
+    in_string = False
+    escape = False
+    for index, char in enumerate(text):
+        if escape:
+            escape = False
+            continue
+        if in_string:
+            if char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            if depth == 0:
+                continue
+            depth -= 1
+            if depth == 0 and start != -1:
+                return text[start : index + 1]
+    return None
+
+
 def _recover_submission_from_final_answer() -> None:
     """Materialize sentiment.json from the harness final answer when needed.
 
-    computer-1 writes the agent's final JSON to final_answer.txt (host + sandbox
-    agent logs, and optionally the output dir). Prefer that over requiring the
-    agent to create files via Finder/Terminal.
+    computer-1 / persona-computer-1 write the agent's final text to
+    final_answer.txt (host agent logs and optionally /app/output). Prefer that
+    over requiring the agent to create files via Finder/Terminal.
     """
     if path.is_file():
         return
@@ -43,11 +75,11 @@ def _recover_submission_from_final_answer() -> None:
         if not fa_path.is_file():
             continue
         raw = fa_path.read_text(encoding="utf-8", errors="replace").strip()
-        match = re.search(r"\{[\s\S]*\}", raw)
-        if not match:
+        candidate_text = _first_balanced_json_object(raw)
+        if not candidate_text:
             continue
         try:
-            candidate = json.loads(match.group())
+            candidate = json.loads(candidate_text)
         except json.JSONDecodeError:
             continue
         if not isinstance(candidate, dict):

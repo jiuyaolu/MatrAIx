@@ -1,6 +1,7 @@
 artifactName: user_feedback.json
 instructions: |
-  Reflect honestly as the persona after finishing the News+ offer review.
+  You've finished reviewing the News+ offer. Answer from what you actually
+  saw on the page — do not revise the subscribe/skip decision you already made.
   Focus on whether browsing the full page plus re-checking features and pricing
   was enough to decide, and whether Get Started felt worth tapping.
 fields:

@@ -645,6 +645,87 @@ def test_run_harbor_passes_yes_to_skip_host_env_prompt(tmp_path):
     service.shutdown()
 
 
+def test_run_harbor_scores_trial_when_result_appears(tmp_path, monkeypatch):
+    import time
+
+    repo = tmp_path
+    jobs_dir = repo / "jobs"
+    jobs_dir.mkdir()
+    config_path = repo / "configs" / "jobs" / "demo-job.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("job_name: demo-job\n", encoding="utf-8")
+
+    scored: list[str] = []
+
+    def _fake_run(command, *, cwd, env):
+        del command, cwd, env
+        trial = jobs_dir / "demo-job" / "trial-x"
+        trial.mkdir(parents=True)
+        (trial / "config.json").write_text("{}", encoding="utf-8")
+        (trial / "result.json").write_text("{}", encoding="utf-8")
+        # Let the watcher poll once before Harbor "exits".
+        time.sleep(0.25)
+        return 0
+
+    service = HarborJobService(
+        repo_root=repo,
+        jobs_dir=jobs_dir,
+        generated_configs_dir=repo / "configs" / "jobs",
+        command_runner=_fake_run,
+        harbor_command=("echo", "harbor", "run"),
+        _host_score_poll_sec=0.05,
+        _host_score_join_timeout_sec=5.0,
+    )
+    monkeypatch.setattr(
+        service,
+        "_score_finished_trial_on_host",
+        lambda trial_dir: scored.append(trial_dir.name),
+    )
+    monkeypatch.setattr(service, "_maybe_run_host_verifier", lambda job_name: None)
+    monkeypatch.setattr(service, "_maybe_generate_post_run_feedback", lambda job_name: None)
+    monkeypatch.setattr(
+        service, "_maybe_schedule_reporting", lambda job_name, job_dir: None
+    )
+    with service._guard:
+        service._launches["demo-job"] = HarborLaunchRecord(
+            job_name="demo-job",
+            config_path="configs/jobs/demo-job.yaml",
+        )
+
+    service._run_harbor("demo-job", config_path)
+
+    assert scored == ["trial-x"]
+    service.shutdown()
+
+
+def test_score_finished_trial_on_host_runs_verifier_then_feedback(tmp_path, monkeypatch):
+    repo = tmp_path
+    trial_dir = repo / "jobs" / "demo-job" / "trial-a"
+    trial_dir.mkdir(parents=True)
+    (trial_dir / "config.json").write_text("{}", encoding="utf-8")
+    (trial_dir / "result.json").write_text("{}", encoding="utf-8")
+
+    order: list[str] = []
+    monkeypatch.setattr(
+        "playground.host_verifier.maybe_run_host_verifier",
+        lambda *, repo_root, trial_dir, timeout_sec=None: order.append("verify"),
+    )
+    monkeypatch.setattr(
+        "playground.post_run_feedback.maybe_write_trial_user_feedback",
+        lambda *, repo_root, trial_dir: order.append("feedback"),
+    )
+    service = HarborJobService(
+        repo_root=repo,
+        jobs_dir=repo / "jobs",
+        generated_configs_dir=repo / "configs" / "jobs",
+    )
+
+    service._score_finished_trial_on_host(trial_dir)
+
+    assert order == ["verify", "feedback"]
+    service.shutdown()
+
+
 def test_trial_live_stage_from_artifacts(tmp_path):
     from backend.service.harbor_job_service import (
         _resolve_trial_stage,

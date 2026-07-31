@@ -32,19 +32,71 @@ IOS_NEWS_SUBSCRIPTION_REQUIRED_KEYS = frozenset(
 )
 
 
+def _first_balanced_json_object(text: str) -> str | None:
+    """Return the first top-level ``{...}`` span, respecting strings/escapes."""
+    if not text:
+        return None
+    start = -1
+    depth = 0
+    in_string = False
+    escape = False
+    for index, char in enumerate(text):
+        if escape:
+            escape = False
+            continue
+        if in_string:
+            if char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            if depth == 0:
+                continue
+            depth -= 1
+            if depth == 0 and start != -1:
+                return text[start : index + 1]
+    return None
+
+
 def parse_json_payload(raw: str) -> dict[str, Any] | None:
-    """Parse a JSON object from plain text or a fenced code block."""
+    """Parse a JSON object from plain text or a fenced code block.
+
+    Prefer a fenced block when present. Otherwise take the first balanced
+    ``{...}`` so trailing commentary / a second JSON block does not poison
+    ``json.loads`` (common on computer-use final answers).
+    """
     text = raw.strip()
     if not text:
         return None
     fence = _JSON_FENCE_RE.search(text)
+    candidates: list[str] = []
     if fence:
-        text = fence.group(1).strip()
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    return data if isinstance(data, dict) else None
+        candidates.append(fence.group(1).strip())
+    candidates.append(text)
+    balanced = _first_balanced_json_object(text)
+    if balanced is not None:
+        candidates.append(balanced)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
 
 
 def _has_required_keys(data: dict[str, Any], required: frozenset[str]) -> bool:
@@ -301,6 +353,129 @@ async def materialize_ios_news_subscription_file(
         logger=logger,
         log_label="ios news subscription",
     )
+
+
+def extract_final_answer_text(trajectory: dict[str, Any]) -> str:
+    """Return the last non-empty agent message — task-agnostic hand-in text."""
+    steps = trajectory.get("steps")
+    if not isinstance(steps, list):
+        return ""
+    for step in reversed(steps):
+        if not isinstance(step, dict):
+            continue
+        if step.get("source") != "agent":
+            continue
+        # Prefer terminal tool payloads when present (done/answer/mark_task_complete).
+        tool_calls = step.get("tool_calls") or []
+        if isinstance(tool_calls, list):
+            for call in reversed(tool_calls):
+                if not isinstance(call, dict):
+                    continue
+                arguments = call.get("arguments") or {}
+                if not isinstance(arguments, dict):
+                    continue
+                name = call.get("function_name")
+                if name == "done" and isinstance(arguments.get("message"), str):
+                    text = arguments["message"].strip()
+                    if text:
+                        return text
+                if name == "mark_task_complete" and isinstance(
+                    arguments.get("result"), str
+                ):
+                    text = arguments["result"].strip()
+                    if text:
+                        return text
+                if name == "computer_action":
+                    action_type = arguments.get("type")
+                    if action_type in TERMINAL_COMPUTER_ACTION_TYPES:
+                        for field in ("result", "text"):
+                            value = arguments.get(field)
+                            if isinstance(value, str) and value.strip():
+                                return value.strip()
+        message = step.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+    return ""
+
+
+async def materialize_final_answer_file(
+    environment: Any,
+    logs_dir: Path,
+    *,
+    logger: Any | None = None,
+    output_paths: tuple[str, ...] = (
+        "/app/output/final_answer.txt",
+        "/logs/agent/final_answer.txt",
+    ),
+) -> bool:
+    """Persist the agent's final answer text — no task-specific schema.
+
+    Writes host ``logs_dir/final_answer.txt`` and mirrors into the environment
+    under ``/app/output`` (artifact collection) plus the agent logs path that
+    verifiers already probe. Task ``test.sh`` / host_verifier turn this into
+    the task's named JSON artifact.
+    """
+    trajectory_path = logs_dir / "trajectory.json"
+    if not trajectory_path.is_file():
+        return False
+    try:
+        trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        if logger:
+            logger.warning("final_answer: could not read trajectory: %s", exc)
+        return False
+    if not isinstance(trajectory, dict):
+        return False
+
+    text = extract_final_answer_text(trajectory)
+    if not text:
+        if logger:
+            logger.warning("final_answer: no agent message found in trajectory")
+        return False
+
+    host_target = logs_dir / "final_answer.txt"
+    try:
+        host_target.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        if logger:
+            logger.warning("final_answer: host write failed: %s", exc)
+        return False
+
+    wrote_env = False
+    for output_path in output_paths:
+        parent = str(Path(output_path).parent)
+        command = (
+            f"mkdir -p {shlex.quote(parent)} && "
+            f"cat > {shlex.quote(output_path)} <<'MATRAIX_FINAL_ANSWER_EOF'\n"
+            f"{text}\n"
+            "MATRAIX_FINAL_ANSWER_EOF"
+        )
+        try:
+            result = await environment.exec(command, timeout_sec=30)
+        except Exception as exc:  # noqa: BLE001
+            if logger:
+                logger.warning(
+                    "final_answer: env write %s failed: %s", output_path, exc
+                )
+            continue
+        if getattr(result, "return_code", 1) != 0:
+            if logger:
+                logger.warning(
+                    "final_answer: env write %s rc=%s stderr=%s",
+                    output_path,
+                    getattr(result, "return_code", None),
+                    (getattr(result, "stderr", None) or "")[:200],
+                )
+            continue
+        wrote_env = True
+
+    if logger:
+        logger.info(
+            "final_answer: wrote host %s%s",
+            host_target,
+            " and environment mirrors" if wrote_env else " (env mirror skipped)",
+        )
+    return True
 
 
 _SUBMISSION_PROFILES: dict[str, Callable[..., Any]] = {
